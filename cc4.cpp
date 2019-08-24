@@ -7,6 +7,7 @@
 #include <limits>
 #include <forward_list>
 #include <array>
+#include <thread>
 #include <arm_neon.h>
 
 // g++ -o cc4 -std=c++11 -g -O3 -march=native cc4.cpp && time ./cc4 test.rgb 1920 1080 1 50 black 0 50 0 50 0 50
@@ -14,8 +15,8 @@
 using namespace std;
 
 typedef struct {
-  string name;
-  unsigned char lor, hir, log, hig, lob, hib, id;
+  string name = "none";
+  unsigned char lor = 255, hir = 0, log = 255, hig = 0, lob = 255, hib = 0;
 } threshold;
 
 typedef struct {
@@ -32,6 +33,39 @@ typedef struct {
   forward_list<rle> top, bottom;
 } region;
 
+template<unsigned width, size_t numThresholds>
+void foo(rgb *in, unsigned height, unsigned minCount, array<threshold, numThresholds> &thresholds, vector<vector<rle> > &groups) {
+  groups.clear();
+  groups.reserve(height);
+  for (unsigned y=0; y<height; y++) {
+    unsigned prev = 0;
+    groups.push_back(vector<rle>());
+    uint8_t colors[16] = {0};
+    for (unsigned x=0; x<width/4; x++) {
+      if (!(x&15)) {
+        uint8x16x3_t pxs = vld3q_u8(&in[x + y*width].r);
+        uint8x16_t color = vdupq_n_u8(0);
+        for (unsigned ti = 0; ti < numThresholds; ti++) {
+          uint8x16_t cnt = vcgeq_u8(pxs.val[0], vdupq_n_u8(thresholds[ti].lor));
+          cnt = vandq_u8(cnt, vcleq_u8(pxs.val[0], vdupq_n_u8(thresholds[ti].hir)));
+          cnt = vandq_u8(cnt, vcgeq_u8(pxs.val[1], vdupq_n_u8(thresholds[ti].log)));
+          cnt = vandq_u8(cnt, vcleq_u8(pxs.val[1], vdupq_n_u8(thresholds[ti].hig)));
+          cnt = vandq_u8(cnt, vcgeq_u8(pxs.val[2], vdupq_n_u8(thresholds[ti].lob)));
+          cnt = vandq_u8(cnt, vcleq_u8(pxs.val[2], vdupq_n_u8(thresholds[ti].hib)));
+          color = vmaxq_u8(color, vandq_u8(cnt, vdupq_n_u8(ti+1)));
+        }
+        vst1q_u8(colors, color);
+      }
+      unsigned cur = colors[x&15];
+      if (cur && cur != prev)
+        groups[y].push_back({x, width/4, cur});
+      if (cur != prev && prev)
+        groups[y].rbegin()->end = x;
+      prev = cur;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   argv++;
   ifstream infile(*argv++, ios::binary);
@@ -41,7 +75,7 @@ int main(int argc, char **argv) {
   argv++;
   unsigned minCount = atoi(*argv++);
 
-  array<threshold, 8> thresholds({"none", 255, 0, 255, 0, 255, 0, 1});
+  array<threshold, 8> thresholds;
   for (auto &a : thresholds) {
     if (!*argv)
       break;
@@ -52,56 +86,29 @@ int main(int argc, char **argv) {
     a.hig = atoi(*argv++);
     a.lob = atoi(*argv++);
     a.hib = atoi(*argv++);
-    a.id = &a - &thresholds[0] + 1;
   }
 
   rgb *in = new rgb [width * height];
   vector<region> complete, incomplete;
+  vector<vector<rle> > groups[4];
   stack<region *> freed;
 
   while (infile.read(reinterpret_cast<char*>(in), width * height * sizeof(rgb))) {
     size_t a = 0, b = 0, d = 0;
     for (int benchmark=0; benchmark<1000; benchmark++) {
+      thread threads[3];
       complete.clear();
       incomplete.clear();
+      while (!freed.empty())
+        freed.pop();
       complete.reserve(32);
       incomplete.reserve(32);
+      for (unsigned ti = 1; ti<4; ti++)
+        threads[ti-1] = thread(foo<width, 8>, in+width*ti/4, height, minCount, ref(thresholds), ref(groups[ti]));
+      foo<width, 8>(in, height, minCount, thresholds, groups[0]);
+      for (auto &ti : threads)
+        ti.join();
       for (unsigned y=0; y<height; y++) {
-        unsigned prev = 0;
-        forward_list<rle> groups;
-        for (unsigned x=0; x<width; x++) {
-          static uint8_t colors[16] = {0};
-          if (!(x&15)) {
-            uint8x16x3_t pxs = vld3q_u8(&in[x + y*width].r);
-            uint8x16_t color = vdupq_n_u8(0);
-            for (unsigned short ti = 0; ti < thresholds.size(); ti++) { // Hardcoding this limit make a significant improvement to performance
-              uint8x16_t cnt = vcgeq_u8(pxs.val[0], vdupq_n_u8(thresholds[ti].lor));
-              cnt = vandq_u8(cnt, vcleq_u8(pxs.val[0], vdupq_n_u8(thresholds[ti].hir)));
-              cnt = vandq_u8(cnt, vcgeq_u8(pxs.val[1], vdupq_n_u8(thresholds[ti].log)));
-              cnt = vandq_u8(cnt, vcleq_u8(pxs.val[1], vdupq_n_u8(thresholds[ti].hig)));
-              cnt = vandq_u8(cnt, vcgeq_u8(pxs.val[2], vdupq_n_u8(thresholds[ti].lob)));
-              cnt = vandq_u8(cnt, vcleq_u8(pxs.val[2], vdupq_n_u8(thresholds[ti].hib)));
-              color = vmaxq_u8(color, vandq_u8(cnt, vdupq_n_u8(ti+1)));
-            }
-            vst1q_u8(colors, color);
-          }
-          unsigned cur = colors[x&15];
-//           rgb px = in[x + y*width];
-//           unsigned cur = thresholds.size();
-//           for (const threshold &t : thresholds) {
-//             if (t.lor <= px.r && px.r <= t.hir && t.log <= px.g && px.g <= t.hig &&
-//                 t.lob <= px.b && px.b <= t.hib) {
-//               cur = t.id;
-//               break;
-//             }
-//           }
-          if (cur && !prev)
-            groups.push_front({x, width, cur});
-          else if (!cur && prev)
-            groups.front().end = x;
-          prev = cur;
-        }
-        size_t c = 0;
         for (auto &r : incomplete) {
           if (r.bottom.empty() && r.count) {
             if (r.count > minCount)
@@ -112,7 +119,24 @@ int main(int argc, char **argv) {
           r.top = r.bottom;
           r.bottom.clear();
         }
-        for (auto &g : groups) {
+        size_t c = 0;
+        vector<rle> combinedGroups;
+        bool doFirst = true;
+        for (unsigned ti = 1; ti<4; ti++) {
+          for (auto const &g : groups[ti-1][y])
+            if (doFirst || &g != &(*(groups[ti-1][y].cbegin())))
+              combinedGroups.push_back({g.start+(ti-1)*width/4, g.end+(ti-1)*width/4, g.color});
+          if (groups[ti][y].size() && groups[ti][y][0].start == 0 && groups[ti-1][y].size() && groups[ti-1][y].rbegin()->end == width/4 && groups[ti][y][0].color == groups[ti-1][y].rbegin()->color) {
+            combinedGroups.rbegin()->end = groups[ti][y][0].end+ti*width/4;
+            doFirst = false;
+          } else {
+            doFirst = true;
+          }
+        }
+        for (auto &g : groups[3][y])
+          if (doFirst || &g != &(*(groups[3][y].begin())))
+            combinedGroups.push_back({g.start+3*width/4, g.end+3*width/4, g.color});
+        for (auto &g : combinedGroups) {
           c++;
           forward_list<region*> connected;
           for (auto &r : incomplete)
@@ -121,7 +145,7 @@ int main(int argc, char **argv) {
                 if (rg.start < g.end && g.start < rg.end)
                   connected.push_front(&r);
           unsigned start = g.start, end = g.end, endm1 = end - 1;
-          d += end-start;
+    //       d += end-start;
           if (connected.empty()) {
             forward_list<rle> g0(1, {g});
             region r = {start, y, endm1, y, start+y, start-y+height, endm1-y+height, endm1+y,
@@ -167,8 +191,8 @@ int main(int argc, char **argv) {
             }
           }
         }
-        a = max(a, c);
-        b += c;
+    //     a = max(a, c);
+    //     b += c;
       }
       for (auto &r : incomplete)
         if (r.count > minCount)
@@ -178,7 +202,7 @@ int main(int argc, char **argv) {
     a = 0;
     for (auto &i : complete)
       a += i.count;
-    cout << a << ' ' << incomplete.capacity() << ' ' << incomplete.size() << endl;
+    cout << a << endl;
     for (auto &i : complete)
       cout << i.count << ' ' << thresholds[i.color-1].name << ' ' << (i.xc/i.count) << ' ' << (i.yc/i.count) << ' ' << i.x0 << ' ' << i.y0 << ' ' << i.x1 << ' ' << i.y1 << ' ' << i.x0y0 << ' ' << i.x0y1 << ' ' << i.x1y0 << ' ' << i.x1y1 << ' ' << endl;
   }
